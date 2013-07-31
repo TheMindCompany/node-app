@@ -1,0 +1,137 @@
+#!/bin/bash
+
+set -eu # -x for verbose logging to juju debug-log
+
+umask 002
+
+install_root=`config-get install_root`
+app_name=`config-get app_name`
+app_dir="$install_root/$app_name"
+app_user=`config-get app_user`
+app_branch=`config-get app_branch`
+app_port=`config-get app_port`
+app_node_env=`config-get app_node_env`
+cron_schedule=`config-get polling_schedule`
+
+update_app() {
+    cd $app_dir
+
+    is_branch=false
+
+    # Always fetch latest if branch requested
+    if git checkout origin/${app_branch}; then # is a local branch
+	git fetch origin && git checkout origin/${app_branch}
+        is_branch=true
+    else # tag/commit ref?
+	if ! git checkout ${app_branch}; then # commit does not exist locally
+	    git fetch origin
+	    if ! git checkout origin/${app_branch}; then # not a new remote branch, is a commit ref/tag
+		git checkout $app_branch
+            else
+                is_branch=true
+            fi
+	fi
+    fi
+}
+
+configure_app() {
+  juju-log "Configuring ${app_name}..."
+
+  # If Procfile found, use it with foreman module to create upstart script
+  if [ -f ${app_dir}/Procfile ]; then
+    juju-log "Using Procfile to configure ${app_name} using foreman..."
+
+    if [ -f /etc/juju_nodejs_app_${app_name}_mongodb.env ]; then
+	mongodb_config=`cat /etc/juju_nodejs_app_${app_name}_mongodb.env`
+    else
+	mongodb_config='""'
+    fi
+
+    cat > /etc/juju_nodejs_app_${app_name}.env <<EOS
+{
+    "name": "${app_name}"
+    , "node_env": "${app_node_env}"
+    , "mongo": ${mongodb_config}
+}
+EOS
+
+    cd $app_dir # foreman export uses this as root
+    nf export -j ${app_dir}/Procfile -e /etc/juju_nodejs_app_${app_name}.env -a ${app_name} -u ${app_user} -p ${app_port} -o /etc/init -t upstart
+  else
+    config_file_path=${app_dir}/config/config.js
+    if [ -f $config_file_path ]; then
+      juju-log "Writing $app_name config file $config_file_path"
+      sed -i "s/name.*/name\" : \"${app_name}\"/" $config_file_path
+      sed -i "s/listen_port.*/listen_port\" : \"${app_port}\"/" $config_file_path
+    fi
+  fi
+}
+
+install_cronjob() {
+    update_cron_job_filename=/opt/bin/update_node-app_from_SCM.sh
+
+    if [ $is_branch ]; then
+	if [ ! -d `dirname $update_cron_job_filename` ]; then
+            mkdir -p `dirname $update_cron_job_filename`
+	fi
+
+	cat > $update_cron_job_filename <<EOS
+
+#!/usr/bin/env bash
+
+cd \${app_dir}
+
+old_commit=\`git rev-parse origin/\${app_branch}\`
+
+echo "Checking for updates to \${app_name} branch \${app_branch} commit \${old_commit}"
+git fetch origin
+
+new_commit=\`git rev-parse origin/\${app_branch}\`
+
+if [ \$old_commit != \$new_commit ]; then
+    echo "Found new latest commit \${new_commit}"
+
+    git checkout origin/\${app_branch}
+    npm update && npm install
+    sudo service \${app_name} restart
+else
+    echo 'No updates found';
+fi
+EOS
+
+	chmod u=rwx,g=r,o=r $update_cron_job_filename
+        chown ${app_user} $update_cron_job_filename
+
+	cat > $update_cron_d_file <<EOF
+app_branch=$app_branch
+app_name=$app_name
+app_dir=$app_dir
+
+$cron_schedule $app_user $update_cron_job_filename
+EOF
+        chmod u=rwx,g=r,o=r $update_cron_d_file
+    else
+        juju-log "Ignoring polling for new code as commit/tag specified"
+
+	if [ -f $update_cron_d_file ]; then
+	    rm $update_cron_d_file
+	fi
+    fi
+}
+
+update_app
+configure_app
+
+update_cron_d_file=/etc/cron.d/${app_name} # TODO: what happens if app_name changes?
+
+if [ "$cron_schedule" != "" ]; then
+    install_cronjob
+elif [ -f $update_cron_d_file ]; then
+    rm $update_cron_d_file
+fi
+
+npm update && npm install
+
+chown -Rf ${app_user}.${app_user} ${app_dir}
+
+service ${app_name} restart

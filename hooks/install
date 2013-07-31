@@ -1,0 +1,64 @@
+#!/bin/bash
+
+set -eu # -x for verbose logging to juju debug-log
+
+umask 002
+
+install_root=`config-get install_root`
+app_name=`config-get app_name`
+app_dir="$install_root/$app_name"
+app_user=`config-get app_user`
+app_scm=`config-get app_scm`
+app_url=`config-get app_url`
+app_branch=`config-get app_branch`
+app_port=`config-get app_port`
+
+apt-get -y install -qq git-core
+
+install_node() {
+  juju-log "Installing node..."
+  apt-get -y install -qq build-essential curl
+  wget http://nodejs.org/dist/v0.10.15/node-v0.10.15.tar.gz && tar -xvzf node-v0.10.15.tar.gz && cd node-v0.10.15 && ./configure && sudo make && sudo make install
+  npm install express -g
+}
+[[ -x /usr/bin/node ]] || install_node
+
+install_app() {
+  juju-log "Installing ${app_name}..."
+  git clone ${app_url} ${app_dir} -b ${app_branch}
+  chown -Rf ${app_user}.${app_user} ${app_dir}
+
+  if [ -f ${app_dir}/package.json ]; then
+    cd ${app_dir} && npm install
+  fi
+
+  # If Procfile found, use it with foreman module
+  if [ -f ${app_dir}/Procfile ]; then
+    npm install -g foreman
+  else
+    cat > /etc/init/${app_name}.conf <<EOS
+description "${app_name} node.js server"
+ 
+start on (net-device-up
+          and local-filesystems
+          and runlevel [2345])
+stop on runlevel [!2345]
+ 
+expect fork
+respawn
+ 
+script
+  export HOME=/
+  export NODE_PATH=/usr/local/lib/node_modules
+  #exec sudo -u ${app_user} /usr/local/bin/node ${app_dir}/server.js >> /var/log/${app_name}.log 2>&1 &
+  exec /usr/local/bin/node ${app_dir}/server.js >> /var/log/${app_name}.log 2>&1 &
+end script
+EOS
+  fi
+}
+[[ -d ${app_dir} ]] || install_app
+
+juju-log "Delaying app startup until mongodb joins" 
+#juju-log "starting app"
+#service ${app_name} restart || service ${app_name} start
+

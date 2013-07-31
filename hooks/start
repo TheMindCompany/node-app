@@ -1,0 +1,3 @@
+#!/bin/bash
+
+# delay startup until mongo joins

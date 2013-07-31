@@ -1,0 +1,5 @@
+#!/bin/bash
+
+app_name=`config-get app_name`
+service ${app_name} status && service ${app_name} stop
+
